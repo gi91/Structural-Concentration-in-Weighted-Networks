@@ -1,0 +1,739 @@
+# =============================================================================
+#  NCI — Financial Market Dependence Network
+#  S&P 500 Top-20 Large-Cap Stocks, 2015–2025
+#  Daily returns from Yahoo Finance (via quantmod)
+#
+#  Riso & Zoia (2026) — Empirical Application: Equity Dependence Networks
+#
+#  Nodes  = 20 S&P 500 stocks by market cap
+#  Edges  = Minimum Spanning Tree of the return correlation matrix
+#  Weights = w_i = MarketCap_i / Σ MarketCap_j
+#  Indices = Baseline NCI  vs  HHI  vs  Gini
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(quantmod)       # downloads Yahoo Finance data
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(igraph)
+  library(scales)
+  library(ggrepel)
+  library(reshape2)
+})
+
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+
+set.seed(42)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GRAPHICAL THEME — identical to the paper
+# ─────────────────────────────────────────────────────────────────────────────
+
+theme_nci <- function(base = 11) {
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(colour = "grey92", linewidth = 0.3),
+      strip.background  = element_rect(fill = "grey95", colour = "grey75"),
+      strip.text        = element_text(face = "bold", size = base - 1),
+      plot.title        = element_text(face = "bold", size = base + 1, hjust = 0),
+      plot.subtitle     = element_text(size = base - 2, colour = "grey45"),
+      axis.title        = element_text(size = base - 1),
+      legend.position   = "bottom",
+      legend.key.size   = unit(0.45, "cm"),
+      legend.text       = element_text(size = base - 2),
+      plot.margin       = margin(8, 12, 8, 8)
+    )
+}
+
+# GICS sector palette (node colours by sector)
+pal_gics <- c(
+  "Technology"             = "#2166ac",
+  "Communication"          = "#4dac26",
+  "Consumer Discretionary" = "#d6604d",
+  "Health Care"            = "#7b3294",
+  "Financials"             = "#b35806",
+  "Consumer Staples"       = "#1a9850",
+  "Energy"                 = "#e66101",
+  "Industrials"            = "grey50"
+)
+
+pal_idx <- c(
+  "NCI (Baseline)" = "#2166ac",
+  "HHI"            = "#b35806",
+  "Gini"           = "#7b3294"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1 — TOP-20 S&P 500 METADATA
+#  Ticker, name, GICS sector, approximate market cap (USD billions, end-2024)
+# ─────────────────────────────────────────────────────────────────────────────
+
+stocks <- data.frame(
+  ticker  = c("AAPL","MSFT","NVDA","AMZN","GOOGL",
+              "META","BRK-B","LLY","AVGO","TSLA",
+              "WMT","JPM","V","XOM","UNH",
+              "ORCL","MA","COST","HD","PG"),
+  name    = c("Apple","Microsoft","NVIDIA","Amazon","Alphabet",
+              "Meta","Berkshire","Eli Lilly","Broadcom","Tesla",
+              "Walmart","JPMorgan","Visa","ExxonMobil","UnitedHealth",
+              "Oracle","Mastercard","Costco","Home Depot","P&G"),
+  sector  = c("Technology","Technology","Technology","Consumer Discretionary",
+              "Communication","Communication","Financials","Health Care",
+              "Technology","Consumer Discretionary","Consumer Staples",
+              "Financials","Financials","Energy","Health Care",
+              "Technology","Financials","Consumer Staples",
+              "Consumer Discretionary","Consumer Staples"),
+  # Market cap in USD billions (end-2024, approximate)
+  mktcap  = c(3500, 3100, 3300, 2100, 2100,
+              1400, 950,  800,  750,  700,
+              650,  600,  550,  500,  480,
+              450,  420,  400,  380,  360),
+  stringsAsFactors = FALSE
+)
+
+N <- nrow(stocks)
+cat(sprintf("Stocks: %d\n", N))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — DOWNLOAD DAILY RETURNS (Yahoo Finance via quantmod)
+#  Period: 2015-01-01 → 2025-12-31
+# ─────────────────────────────────────────────────────────────────────────────
+
+DATE_START <- "2015-01-01"
+DATE_END   <- "2025-12-31"
+
+cat("\nDownloading Yahoo Finance data...\n")
+
+prices_list <- lapply(stocks$ticker, function(tk) {
+  tryCatch({
+    getSymbols(tk, src = "yahoo", from = DATE_START, to = DATE_END,
+               auto.assign = FALSE, warnings = FALSE)[, 6]  # Adjusted close
+  }, error = function(e) {
+    cat(sprintf("  Error %s: %s\n", tk, e$message))
+    NULL
+  })
+})
+names(prices_list) <- stocks$ticker
+
+# Drop failed tickers
+ok <- !sapply(prices_list, is.null)
+prices_list <- prices_list[ok]
+stocks      <- stocks[ok, ]
+N           <- nrow(stocks)
+cat(sprintf("  Stocks downloaded successfully: %d\n", N))
+
+# Align dates (inner join)
+prices_xts <- do.call(merge, prices_list)
+colnames(prices_xts) <- stocks$ticker
+
+# Log-returns: r_it = log(P_it / P_{i,t-1})
+returns_xts <- diff(log(prices_xts))
+returns_xts <- na.omit(returns_xts)
+returns_mat <- as.matrix(returns_xts)
+
+cat(sprintf("  Daily observations: %d\n", nrow(returns_mat)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — CORRELATION MATRIX + MINIMUM SPANNING TREE
+#
+#  The MST filters the correlation matrix, retaining only the most
+#  informative links (the N-1 edges minimizing total distance).
+#  Distance: d_ij = sqrt(2 * (1 - rho_ij))  [Mantegna 1999]
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Correlation matrix
+COR <- cor(returns_mat)
+
+# Mantegna distance
+D <- sqrt(2 * (1 - COR))
+diag(D) <- 0
+
+# Complete weighted graph with distances
+g_full <- graph_from_adjacency_matrix(D, mode = "undirected",
+                                      weighted = TRUE, diag = FALSE)
+
+# Minimum Spanning Tree
+g_mst <- mst(g_full, algorithm = "prim")
+
+# MST adjacency matrix (binary, symmetric)
+Adj_mst <- as.matrix(as_adjacency_matrix(g_mst, sparse = FALSE))
+diag(Adj_mst) <- 0
+
+cat(sprintf("\n  MST edges: %d  (expected: %d = N-1)\n",
+            sum(Adj_mst) / 2, N - 1))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4 — WEIGHTS: market cap shares
+# ─────────────────────────────────────────────────────────────────────────────
+
+w <- stocks$mktcap / sum(stocks$mktcap)
+cat(sprintf("\n  Weights w: min=%.4f  max=%.4f  sum=%.4f\n",
+            min(w), max(w), sum(w)))
+
+
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 5 — INDICES
+# ─────────────────────────────────────────────────────────────────────────────
+
+hhi      <- function(w) sum(w^2)
+gini     <- function(w) {
+  n <- length(w); w <- sort(w)
+  2 * sum(seq_len(n) * w) / (n * sum(w)) - (n + 1) / n
+}
+nci_base <- function(w, A) {
+  d <- 1 - hhi(w)
+  if (d <= 1e-10) stop("1 - HHI troppo piccolo")
+  as.numeric(t(w) %*% A %*% w) / d
+}
+
+H   <- hhi(w)
+G   <- gini(w)
+NCI <- nci_base(w, Adj_mst)
+
+cat(sprintf("\n=== CONCENTRATION INDICES ===\n"))
+cat(sprintf("  HHI  = %.4f\n", H))
+cat(sprintf("  Gini = %.4f\n", G))
+cat(sprintf("  NCI  = %.4f\n", NCI))
+
+
+
+theta_med <- median(D[upper.tri(D)])
+A_thr <- (D < theta_med) * 1L
+diag(A_thr) <- 0L
+psi_thr   <- nci_base(w, A_thr)
+delta_thr <- sum(A_thr) / (20 * 19)
+cat(sprintf("psi_thr = %.4f | delta = %.4f | ratio = %.3f\n",
+            psi_thr, delta_thr, psi_thr/delta_thr))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 6 — FIGURE 1: INDEX BARPLOT  (paper style)
+# ─────────────────────────────────────────────────────────────────────────────
+
+idx_df <- data.frame(
+  Measure = factor(c("NCI (Baseline)", "Gini", "HHI"),
+                   levels = c("HHI", "Gini", "NCI (Baseline)")),
+  Value   = c(NCI, G, H)
+)
+
+fig1 <- ggplot(idx_df, aes(x = Value, y = Measure, fill = Measure)) +
+  geom_col(width = 0.55, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.4f", Value)),
+            hjust = -0.12, size = 4.2, fontface = "bold", colour = "grey20") +
+  scale_fill_manual(values = c(
+    "NCI (Baseline)" = "#2166ac",
+    "Gini"           = "#7b3294",
+    "HHI"            = "#b35806")) +
+  scale_x_continuous(limits = c(0, max(NCI, G, H) * 1.38), expand = c(0, 0)) +
+  labs(
+    title    = "",
+    subtitle = sprintf("S&P 500 Top-%d | MST network | %s–%s | w_i = MarketCap share",
+                       N, substr(DATE_START,1,4), substr(DATE_END,1,4)),
+    x = "Index value", y = NULL
+  ) +
+  theme_nci() +
+  theme(
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(face = "bold", size = 12),
+    axis.text.x        = element_text(face = "bold"),
+    axis.title.x       = element_text(face = "bold")
+  )
+
+print(fig1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 7 — FIGURE 2: DEPENDENCE NETWORK (MST)
+#  Same style as build_net_plot (sectors) and build_country_net_plot (countries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+build_equity_net_plot <- function(Adj, w, stocks, seed = 42, top_label = 20) {
+  
+  N   <- nrow(Adj)
+  g   <- graph_from_adjacency_matrix(Adj, mode = "undirected", diag = FALSE)
+  deg <- degree(g, mode = "all")
+  
+  isolated <- which(deg == 0)
+  n_iso    <- length(isolated)
+  
+  set.seed(seed)
+  lay <- layout_with_kk(g)
+  
+  for (d in 1:2) {
+    rng <- range(lay[, d])
+    if (diff(rng) > 1e-9)
+      lay[, d] <- (lay[, d] - rng[1]) / diff(rng) * 0.88 + 0.06
+  }
+  
+  # If isolated nodes exist, compress layout upward and place them at the bottom
+  if (n_iso > 0) {
+    lay[, 2] <- lay[, 2] * 0.72 + 0.28          # ← as in build_net_plot
+    margin_x  <- 0.04
+    spacing_x <- (1 - 2 * margin_x) / max(n_iso - 1, 1)
+    lay[isolated, 1] <- margin_x + (seq_len(n_iso) - 1) * spacing_x
+    lay[isolated, 2] <- 0.12
+  }
+  
+  node_size <- rescale(w, to = c(4, 18))
+  rnk       <- rank(-w)
+  
+  df_nodes <- data.frame(
+    x        = lay[, 1],
+    y        = lay[, 2],
+    size     = node_size,
+    sector   = stocks$sector,
+    label    = stocks$ticker,
+    name     = stocks$name,
+    weight   = w,
+    rank     = rnk,
+    deg      = deg,
+    isolated = deg == 0
+  )
+  
+  el <- as_edgelist(g, names = FALSE)
+  df_edges <- if (nrow(el) > 0) {
+    data.frame(
+      x    = lay[el[,1], 1], y    = lay[el[,1], 2],
+      xend = lay[el[,2], 1], yend = lay[el[,2], 2]
+    )
+  } else {
+    data.frame(x=numeric(0), y=numeric(0), xend=numeric(0), yend=numeric(0))
+  }
+  
+  # All connected nodes in top_label → always external label with repel
+  df_label_all <- df_nodes[df_nodes$rank <= top_label & !df_nodes$isolated, ]
+  df_iso_lab   <- df_nodes[df_nodes$isolated, ]
+  
+  ggplot() +
+    # ── MST edges ────────────────────────────────────────────────────────────
+    geom_segment(
+      data      = df_edges,
+      aes(x=x, y=y, xend=xend, yend=yend),
+      colour    = "grey45",
+      linewidth = 0.50,
+      alpha     = 0.65
+    ) +
+    # ── Node halo ───────────────────────────────────────────────────────────
+    geom_point(
+      data = df_nodes, aes(x=x, y=y, size=size + 3),
+      colour = "grey15", show.legend = FALSE
+    ) +
+    # ── Node coloured by GICS sector ───────────────────────────────────────
+    geom_point(
+      data  = df_nodes, aes(x=x, y=y, size=size, colour=sector),
+      alpha = 0.92, show.legend = TRUE
+    ) +
+    # ── All connected labels: repel only, no label inside the node ─────────────
+    ggrepel::geom_text_repel(
+      data               = df_label_all,
+      aes(x=x, y=y, label=label),
+      size               = 2.7,
+      colour             = "grey10",
+      fontface           = "bold",
+      segment.size       = 0.30,
+      segment.colour     = "grey40",
+      segment.curvature  = 0.1,
+      min.segment.length = 0.0,
+      box.padding        = 0.55,
+      point.padding      = 0.40,
+      force              = 8,
+      force_pull         = 0.5,
+      max.iter           = 10000,
+      max.overlaps       = Inf,
+      seed               = seed,
+      ylim               = c(0.26, NA),
+      bg.color           = "white",
+      bg.r               = 0.14
+    ) +
+    # ── Isolated node labels ───────────────────────────────────────────────────
+    ggrepel::geom_text_repel(
+      data               = df_iso_lab,
+      aes(x=x, y=y, label=label),
+      size               = 2.6,
+      colour             = "grey10",
+      fontface           = "bold",
+      segment.size       = 0.25,
+      segment.colour     = "grey55",
+      min.segment.length = 0,
+      box.padding        = 0.5,
+      point.padding      = 0.3,
+      force              = 4,
+      force_pull         = 0.2,
+      direction          = "x",
+      nudge_y            = -0.055,
+      ylim               = c(NA, 0.10),
+      max.overlaps       = Inf,
+      seed               = seed,
+      bg.color           = "white",
+      bg.r               = 0.15
+    ) +
+    scale_colour_manual(values = pal_gics, name = "Sector") +
+    scale_size_identity() +
+    scale_x_continuous(limits = c(0, 1), expand = c(0.03, 0.03)) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0.03, 0.03)) +
+    coord_fixed(1, clip = "off") +
+    labs(title = "") +
+    guides(
+      colour = guide_legend(
+        nrow         = 2,
+        byrow        = TRUE,
+        override.aes = list(size = 5)
+      )
+    ) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.subtitle    = element_text(size=8.5, colour="grey35", hjust=0.5),
+      legend.position  = "bottom",
+      legend.direction = "horizontal",
+      legend.title     = element_text(face="bold", size=9),
+      legend.text      = element_text(face="bold", size=8),
+      legend.key.size  = unit(0.55, "cm"),
+      legend.spacing.x = unit(0.3, "cm"),
+      plot.background  = element_rect(fill="white", colour=NA),
+      plot.margin      = margin(10, 10, 15, 10)
+    )
+}
+
+fig2 <- build_equity_net_plot(Adj_mst, w, stocks, seed = 42, top_label = N)
+print(fig2)
+
+ggsave("Net_fiance.png", fig2, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 8 — FIGURE 3: CORRELATION HEATMAP (same style as the country application)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Sort by decreasing market cap
+ord      <- order(-stocks$mktcap)
+COR_ord  <- COR[ord, ord]
+tk_ord   <- stocks$ticker[ord]
+nm_ord   <- stocks$name[ord]
+
+cor_long <- reshape2::melt(COR_ord,
+                           varnames  = c("X","Y"),
+                           value.name = "r") |>
+  mutate(
+    X = factor(X, levels = tk_ord),
+    Y = factor(Y, levels = rev(tk_ord))
+  )
+
+fig3 <- ggplot(cor_long, aes(x = X, y = Y, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", r)),
+            size = 2.2, colour = "grey10") +
+  scale_fill_gradient2(
+    low      = "#d6604d",
+    mid      = "white",
+    high     = "#2166ac",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "ρ"
+  ) +
+  labs(
+    title    = "",
+    subtitle = sprintf("S&P 500 Top-%d | daily log-returns | %s–%s",
+                       N, substr(DATE_START,1,4), substr(DATE_END,1,4)),
+    x = NULL, y = NULL
+  ) +
+  theme_nci(base = 9) +
+  theme(
+    aspect.ratio = 1,
+    axis.text.x  = element_text(angle = 45, hjust = 1, face = "bold", size = 7),
+    axis.text.y  = element_text(face = "bold", size = 7),
+    legend.position = "right"
+  )
+
+print(fig3)
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 9 — FIGURE 4: WEIGHT DISTRIBUTION (market cap share)
+# ─────────────────────────────────────────────────────────────────────────────
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# dataframe with weights in increasing order
+wt_df <- data.frame(
+  ticker = stocks$ticker,
+  sector = stocks$sector,
+  w      = w
+) |>
+  arrange(w) |> 
+  mutate(ticker = fct_inorder(ticker))
+
+# plot
+fig4 <- ggplot(wt_df, aes(x = w, y = ticker, fill = sector)) +
+  geom_col(width = 0.72, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(
+    values = pal_gics,
+    name = "Sector"
+  ) +
+  
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 0.1),
+    limits = c(0, max(w) * 1.28),
+    expand = c(0, 0)
+  ) +
+  
+  labs(
+    title    = "",
+    x=expression(bold(omega[i])),
+    y = NULL
+  ) +
+  
+  theme_nci() +
+  theme(axis.text.x=element_text(angle=65, hjust=1, size=9,face="bold"),
+        axis.text.y=element_text(size=10,face="bold"),
+        axis.title.y=element_text(face="bold",size=15),
+        legend.text=element_text(face="bold", size=11),
+        legend.title =element_text(face="bold", size=13),
+        legend.position="right")
+
+
+print(fig4)
+ggsave("Weight_fiance.png", fig4, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 10 — FIGURE 5: NCI / HHI / Gini on rolling time windows
+#  Window = 252 days (1 year), step = 63 days (1 quarter)
+#  Shows that the NCI varies over time while HHI and Gini are more stable
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n=== Rolling window NCI ===\n")
+
+WINDOW <- 252   # 1 year
+STEP   <- 63    # 1 quarter
+
+T_tot  <- nrow(returns_mat)
+starts <- seq(1, T_tot - WINDOW + 1, by = STEP)
+
+roll_df <- bind_rows(lapply(starts, function(t0) {
+  tryCatch({
+    ret_w   <- returns_mat[t0:(t0 + WINDOW - 1), ]
+    cor_w   <- cor(ret_w)
+    d_w     <- sqrt(2 * (1 - cor_w)); diag(d_w) <- 0
+    g_w     <- graph_from_adjacency_matrix(d_w, mode="undirected",
+                                           weighted=TRUE, diag=FALSE)
+    g_mst_w <- mst(g_w, algorithm="prim")
+    A_w     <- as.matrix(as_adjacency_matrix(g_mst_w, sparse=FALSE))
+    diag(A_w) <- 0
+    date_mid <- index(returns_xts)[t0 + WINDOW %/% 2]
+    data.frame(
+      date = as.Date(date_mid),
+      NCI  = nci_base(w, A_w),
+      HHI  = hhi(w),
+      Gini = gini(w)
+    )
+  }, error = function(e) NULL)
+}))
+
+cat(sprintf("  Windows computed: %d\n", nrow(roll_df)))
+
+roll_long <- roll_df |>
+  pivot_longer(c(NCI, HHI, Gini), names_to = "Index", values_to = "Value") |>
+  mutate(
+    Index = recode(Index, "NCI" = "NCI (Baseline)"),
+    Index = factor(Index, levels = c("NCI (Baseline)", "HHI", "Gini"))
+  )
+
+fig5 <- ggplot(roll_long, aes(x = date, y = Value,
+                              colour = Index, linetype = Index)) +
+  geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = pal_idx) +
+  scale_linetype_manual(values = c(
+    "NCI (Baseline)" = "solid",
+    "HHI"            = "dashed",
+    "Gini"           = "dotdash")) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title    = "",
+    x = "Date", y = "Index value",
+    colour = NULL, linetype = NULL
+  ) +
+  theme_nci() +
+  theme(axis.title=element_text(face="bold",size=12),
+        axis.text=element_text(face="bold",size=12),
+        legend.text=element_text(face="bold", size=11),
+        legend.position="bottom")
+
+print(fig5)
+
+ggsave("Evolution_NCI_fiance.png", fig5, width = 15, height = 10, dpi = 300, bg = "white")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 10 — FIGURE 5: rolling NCI / HHI / Gini + bootstrap CI on the NCI
+# ─────────────────────────────────────────────────────────────────────────────
+
+WINDOW <- 252
+STEP   <- 63
+B_BOOT <- 500   # bootstrap replicates per window
+
+T_tot  <- nrow(returns_mat)
+starts <- seq(1, T_tot - WINDOW + 1, by = STEP)
+
+# ── Bootstrap function ───────────────────────────────────────────────────────
+boot_nci <- function(ret_window, w, B = 500) {
+  T <- nrow(ret_window)
+  replicate(B, {
+    idx   <- sample(T, T, replace = TRUE)
+    cor_b <- cor(ret_window[idx, ])
+    d_b   <- sqrt(2 * (1 - cor_b)); diag(d_b) <- 0
+    g_b   <- graph_from_adjacency_matrix(d_b, mode = "undirected",
+                                         weighted = TRUE, diag = FALSE)
+    A_b   <- as.matrix(as_adjacency_matrix(mst(g_b), sparse = FALSE))
+    diag(A_b) <- 0
+    nci_base(w, A_b)
+  })
+}
+
+# ── Rolling loop with bootstrap ───────────────────────────────────────────────
+cat("\n=== Rolling window NCI + Bootstrap ===\n")
+
+roll_df <- bind_rows(lapply(seq_along(starts), function(i) {
+  t0 <- starts[i]
+  tryCatch({
+    ret_w <- returns_mat[t0:(t0 + WINDOW - 1), ]
+    
+    # Point NCI
+    cor_w   <- cor(ret_w)
+    d_w     <- sqrt(2 * (1 - cor_w)); diag(d_w) <- 0
+    g_w     <- graph_from_adjacency_matrix(d_w, mode = "undirected",
+                                           weighted = TRUE, diag = FALSE)
+    g_mst_w <- mst(g_w, algorithm = "prim")
+    A_w     <- as.matrix(as_adjacency_matrix(g_mst_w, sparse = FALSE))
+    diag(A_w) <- 0
+    nci_pt  <- nci_base(w, A_w)
+    
+    # Bootstrap CI
+    boot_vals <- boot_nci(ret_w, w, B = B_BOOT)
+    nci_lo    <- quantile(boot_vals, 0.025)
+    nci_hi    <- quantile(boot_vals, 0.975)
+    
+    date_mid <- index(returns_xts)[t0 + WINDOW %/% 2]
+    
+    if (i %% 5 == 0)
+      cat(sprintf("  Window %d/%d — NCI=%.4f [%.4f, %.4f]\n",
+                  i, length(starts), nci_pt, nci_lo, nci_hi))
+    
+    data.frame(
+      date    = as.Date(date_mid),
+      NCI     = nci_pt,
+      NCI_lo  = nci_lo,
+      NCI_hi  = nci_hi,
+      HHI     = hhi(w),
+      Gini    = gini(w)
+    )
+  }, error = function(e) {
+    cat(sprintf("  Error in window %d: %s\n", i, e$message))
+    NULL
+  })
+}))
+
+cat(sprintf("  Windows computed: %d\n", nrow(roll_df)))
+
+# ── Long format for the lines (NCI / HHI / Gini) ────────────────────────────────
+roll_long <- roll_df |>
+  select(date, NCI, HHI, Gini) |>
+  pivot_longer(c(NCI, HHI, Gini),
+               names_to  = "Index",
+               values_to = "Value") |>
+  mutate(
+    Index = recode(Index, "NCI" = "NCI (Baseline)"),
+    Index = factor(Index, levels = c("NCI (Baseline)", "HHI", "Gini"))
+  )
+
+# ── Separate dataframe for the bootstrap band (NCI only) ─────────────────────
+roll_band <- roll_df |>
+  select(date, NCI_lo, NCI_hi) |>
+  rename(lo = NCI_lo, hi = NCI_hi)
+
+# ── Figure ───────────────────────────────────────────────────────────────────
+fig5 <- ggplot() +
+  # 95% bootstrap band on the NCI
+  geom_ribbon(
+    data  = roll_band,
+    aes(x = date, ymin = lo, ymax = hi),
+    fill  = "#2166ac",
+    alpha = 0.15
+  ) +
+  # Linee NCI / HHI / Gini
+  geom_line(
+    data = roll_long,
+    aes(x = date, y = Value, colour = Index, linetype = Index),
+    linewidth = 0.9
+  ) +
+  scale_colour_manual(values = pal_idx) +
+  scale_linetype_manual(values = c(
+    "NCI (Baseline)" = "solid",
+    "HHI"            = "dashed",
+    "Gini"           = "dotdash"
+  )) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    x      = "Date",
+    y      = "Index value",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_nci() +
+  theme(
+    axis.title  = element_text(face = "bold", size = 12),
+    axis.text   = element_text(face = "bold", size = 12),
+    legend.text = element_text(face = "bold", size = 11),
+    legend.position = "bottom"
+  )
+
+print(fig5)
+ggsave("Evolution_NCI_fiance.png", fig5,
+       width = 15, height = 10, dpi = 300, bg = "white")
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 11 — SALVATAGGIO
+# ─────────────────────────────────────────────────────────────────────────────
+
+out_dir <- "/mnt/user-data/outputs"
+dir.create(out_dir, showWarnings = FALSE)
+
+ggsave(file.path(out_dir, "figF1_equity_indices.pdf"),    fig1, width=7,  height=3.5, dpi=300)
+ggsave(file.path(out_dir, "figF1_equity_indices.jpg"),    fig1, width=7,  height=3.5, dpi=600, bg="white")
+
+ggsave(file.path(out_dir, "figF2_equity_network.pdf"),    fig2, width=13, height=12,  dpi=300)
+ggsave(file.path(out_dir, "figF2_equity_network.png"),    fig2, width=13, height=12,  dpi=300, bg="white")
+
+ggsave(file.path(out_dir, "figF3_correlation_heatmap.pdf"),fig3,width=8,  height=8,   dpi=300)
+ggsave(file.path(out_dir, "figF3_correlation_heatmap.jpg"),fig3,width=8,  height=8,   dpi=600, bg="white")
+
+ggsave(file.path(out_dir, "figF4_mktcap_weights.pdf"),    fig4, width=8,  height=7,   dpi=300)
+ggsave(file.path(out_dir, "figF4_mktcap_weights.jpg"),    fig4, width=8,  height=7,   dpi=600, bg="white")
+
+ggsave(file.path(out_dir, "figF5_rolling_nci.pdf"),       fig5, width=10, height=5,   dpi=300)
+ggsave(file.path(out_dir, "figF5_rolling_nci.jpg"),       fig5, width=10, height=5,   dpi=600, bg="white")
+
+cat(sprintf("\nFile salvati in: %s\n", out_dir))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 12 — OUTPUT LATEX
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n% ─── LaTeX: Tabella risultati equity network ───────────────────────────────\n")
+cat("\\begin{table}[h]\n\\centering\n")
+cat(sprintf("\\caption{Concentration measures for the equity dependence network (S\\&P~500 Top-%d, %s--%s)}\n",
+            N, substr(DATE_START,1,4), substr(DATE_END,1,4)))
+cat("\\label{tab:equity_results}\n")
+cat("\\begin{tabular}{lc}\\hline\n")
+cat("Measure & Value \\\\\n\\hline\n")
+cat(sprintf("Herfindahl--Hirschman Index (HHI) & %.4f \\\\\n", H))
+cat(sprintf("Gini Coefficient                  & %.4f \\\\\n", G))
+cat(sprintf("Network Concentration Index (NCI) & %.4f \\\\\n", NCI))
+cat("\\hline\n\\end{tabular}\n\\end{table}\n")
+
+cat("\n=== Completato ===\n")
