@@ -1,0 +1,708 @@
+########################################################################
+#  DATA AVAILABILITY
+#  The WIOD 2016-release input-output tables (R format, WIOT2014
+#  October 2016 ROW) are freely available at:
+#    https://www.rug.nl/ggdc/valuechain/wiod/wiod-2016-release
+#  Download "WIOT tables in R format" and load the 2014 table, e.g.:
+#    load("path/to/WIOT2014_October16_ROW.RData")
+#  or set WIOD_PATH below to the .RData file location.
+########################################################################
+# load("path/to/WIOT2014_October16_ROW.RData")   # <- set your local path
+
+# =============================================================================
+#  NCI — Production Network Application
+#  World Input-Output Database (WIOD), 2014 Release
+#  Current prices, millions of USD
+#
+#  Riso & Zoia (2026) — Empirical Application III: Production Networks
+#
+#  Indices: Baseline NCI  vs  HHI  vs  Gini
+#  Network: sectors × sectors (aggregated over countries)
+#  Weights: w_i = VA_i / sum(VA)
+#  Edges : ã_ij = (a_ij + a_ji) / 2  >  theta   (symmetric average coefficient)
+#
+#  Note on symmetrization:
+#   a_ij  = Z_agg[i,j] / output_j   (i supplies j)
+#   a_ji  = Z_agg[j,i] / output_i   (j supplies i)
+#   ã_ij  = (a_ij + a_ji) / 2       (average bidirectional intensity)
+#   A[i,j] = A[j,i] = 1  if  ã_ij > theta
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(igraph)
+  library(scales)
+  library(ggrepel)
+})
+
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+
+set.seed(42)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GRAPHICAL THEME
+# ─────────────────────────────────────────────────────────────────────────────
+
+theme_nci <- function(base = 11) {
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(colour = "grey92", linewidth = 0.3),
+      strip.background  = element_rect(fill = "grey95", colour = "grey75"),
+      strip.text        = element_text(face = "bold", size = base - 1),
+      plot.title        = element_text(face = "bold", size = base + 1, hjust = 0),
+      plot.subtitle     = element_text(size = base - 2, colour = "grey45"),
+      axis.title        = element_text(size = base - 1),
+      legend.position   = "bottom",
+      legend.key.size   = unit(0.45, "cm"),
+      legend.text       = element_text(size = base - 2),
+      plot.margin       = margin(8, 12, 8, 8)
+    )
+}
+
+pal_macro <- c(
+  "Agriculture"   = "#4dac26",
+  "Mining"        = "#b35806",
+  "Manufacturing" = "#2166ac",
+  "Utilities"     = "#d6604d",
+  "Construction"  = "#f4a582",
+  "Trade"         = "#7b3294",
+  "Transport"     = "#1a9850",
+  "Finance"       = "#e66101",
+  "Services"      = "grey50"
+)
+
+pal_idx <- c(
+  "NCI (Baseline)" = "#2166ac",
+  "HHI"            = "#b35806",
+  "Gini"           = "#7b3294"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WIOD 2016 CODES — 56 sectors
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIOD56_CODES <- c(
+  "A01","A02","A03","B",
+  "C10-C12","C13-C15","C16","C17","C18","C19","C20","C21",
+  "C22","C23","C24","C25","C26","C27","C28","C29","C30","C31_C32","C33",
+  "D35","E36","E37-E39","F",
+  "G45","G46","G47",
+  "H49","H50","H51","H52","H53","I",
+  "J58","J59_J60","J61","J62_J63",
+  "K64","K65","K66","L68",
+  "M69_M70","M71","M72","M73_M74","M75","N",
+  "O84","P85","Q","R_S","T","U"
+)
+
+WIOD56_LABELS <- c(
+  "Crops","Forestry","Fishing","Mining",
+  "Food","Textiles","Wood","Paper","Printing","Petroleum","Chemicals","Pharma",
+  "Plastics","Minerals","Metals","Fab.Metal","Electronics","Elec.Equip","Machinery",
+  "Vehicles","Transp.Eq","Furniture","Repair",
+  "Energy","Water","Waste","Construction",
+  "Auto Trade","Wholesale","Retail",
+  "Land Tr.","Water Tr.","Air Tr.","Warehousing","Post","Hospitality",
+  "Publishing","Media","Telecom","IT",
+  "Banking","Insurance","Fin.Aux","Real Est.",
+  "Legal","Architect","R&D","Advertising","Vet","Admin",
+  "Public Adm","Education","Health","Arts","Households","Extra-terr."
+)
+
+WIOD56_MACRO <- c(
+  rep("Agriculture", 3), "Mining",
+  rep("Manufacturing", 19),
+  "Utilities", "Utilities", "Utilities",
+  "Construction",
+  rep("Trade", 3),
+  rep("Transport", 6),
+  rep("Services", 4),
+  rep("Finance", 4),
+  rep("Services", 6),
+  rep("Services", 6)
+)
+
+stopifnot(length(WIOD56_CODES)  == 56,
+          length(WIOD56_LABELS) == 56,
+          length(WIOD56_MACRO)  == 56)
+
+sector_meta <- data.frame(
+  code  = WIOD56_CODES,
+  label = WIOD56_LABELS,
+  macro = WIOD56_MACRO,
+  s_id  = 1:56,
+  stringsAsFactors = FALSE
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1 — LOAD WIOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIOD_PATH <- NULL
+
+load_wiot <- function(path = WIOD_PATH) {
+  if (exists("wiot", envir = .GlobalEnv)) {
+    cat("  [OK] Object 'wiot' found in memory.\n")
+    return(as.data.table(get("wiot", envir = .GlobalEnv)))
+  }
+  if (!is.null(path) && file.exists(path)) {
+    ext <- tolower(tools::file_ext(path))
+    if (ext %in% c("rdata","rda")) {
+      env <- new.env(); load(path, envir = env)
+      obj <- ls(env)[1]
+      cat(sprintf("  [OK] Loaded '%s' from %s\n", obj, path))
+      return(as.data.table(get(obj, envir = env)))
+    }
+    if (ext == "csv") return(fread(path))
+  }
+  stop(paste(
+    "WIOD dataset not found.",
+    "Option 1: load the 'wiot' object into memory.",
+    "Option 2: set WIOD_PATH = 'path/to/WIOT2014_October16_ROW.RData'",
+    "Data freely available at:",
+    "https://www.rug.nl/ggdc/valuechain/wiod/wiod-2016-release",
+    sep = "\n"
+  ))
+}
+
+cat("=== Loading WIOT ===\n")
+wiot_raw <- load_wiot()
+cat(sprintf("  Dimensions: %d rows × %d columns\n", nrow(wiot_raw), ncol(wiot_raw)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — PARSING STRUTTURA WIOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+all_cols    <- names(wiot_raw)
+meta_cols   <- c("IndustryCode","IndustryDescription","Country","RNr","Year")
+inter_cols  <- grep("^[A-Z]{3}[0-9]+$", all_cols, value = TRUE)
+
+col_country <- substr(inter_cols, 1, 3)
+col_sectnum <- as.integer(sub("^[A-Z]{3}", "", inter_cols))
+
+valid_col   <- col_sectnum >= 1 & col_sectnum <= 56
+inter_cols  <- inter_cols[valid_col]
+col_country <- col_country[valid_col]
+col_sectnum <- col_sectnum[valid_col]
+
+cat(sprintf("  Valid intermediate columns: %d (expected 2464)\n", length(inter_cols)))
+
+years_avail <- sort(unique(wiot_raw$Year))
+cat(sprintf("  Available years: %s\n", paste(years_avail, collapse = ", ")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — EXTRACT Z, VA, OUTPUT FOR A GIVEN YEAR
+# ─────────────────────────────────────────────────────────────────────────────
+
+extract_year <- function(dt, yr) {
+  
+  d <- dt[Year == yr]
+  
+  sect_rows <- d[RNr %in% 1:56 & IndustryCode %in% WIOD56_CODES]
+  cat(sprintf("  Year %d | sectoral rows: %d\n", yr, nrow(sect_rows)))
+  
+  sect_rows <- sect_rows[, s_id := match(IndustryCode, WIOD56_CODES)]
+  sect_rows <- sect_rows[!is.na(s_id)]
+  
+  Z_raw <- as.matrix(sect_rows[, ..inter_cols])
+  Z_raw[is.na(Z_raw) | Z_raw < 0] <- 0
+  
+  n_rows  <- nrow(Z_raw)
+  row_sid <- sect_rows$s_id
+  
+  S     <- 56
+  Z_agg <- matrix(0, S, S, dimnames = list(WIOD56_CODES, WIOD56_CODES))
+  
+  for (r in seq_len(n_rows)) {
+    i <- row_sid[r]
+    for (j in 1:S) {
+      cols_j <- which(col_sectnum == j)
+      if (length(cols_j) > 0)
+        Z_agg[i, j] <- Z_agg[i, j] + sum(Z_raw[r, cols_j])
+    }
+  }
+  
+  va_rows <- d[!IndustryCode %in% WIOD56_CODES & RNr > 56]
+  
+  if (nrow(va_rows) > 0) {
+    VA_raw <- as.matrix(va_rows[, ..inter_cols])
+    VA_raw[is.na(VA_raw) | VA_raw < 0] <- 0
+    VA_agg <- numeric(S)
+    for (j in 1:S) {
+      cols_j <- which(col_sectnum == j)
+      if (length(cols_j) > 0)
+        VA_agg[j] <- sum(VA_raw[, cols_j])
+    }
+    cat(sprintf("  VA extracted from %d non-sectoral rows\n", nrow(va_rows)))
+  } else {
+    cat("  No VA row — residual computation\n")
+    VA_agg <- pmax(colSums(Z_agg) * 0.45, 1)
+  }
+  
+  output_j <- colSums(Z_agg) + VA_agg
+  output_j[output_j <= 0] <- 1
+  
+  list(Z = Z_agg, VA = VA_agg, output = output_j, S = S)
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4 — SYMMETRIC NETWORK CONSTRUCTION
+#
+#  Symmetrization via the AVERAGE of the technical coefficients:
+#    a_ij  = Z_agg[i,j] / output_j   (i supplies j)
+#    a_ji  = Z_agg[j,i] / output_i   (j supplies i)
+#    ã_ij  = (a_ij + a_ji) / 2       (average bidirectional intensity)
+#
+#  Symmetric adjacency:
+#    A[i,j] = A[j,i] = 1  if  ã_ij > theta
+#
+#  Check: max(abs(Adj - t(Adj))) == 0  must be TRUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+build_network <- function(io, theta = 0.01) {
+  
+  # Coefficienti tecnici direzionali: a_ij = Z_agg[i,j] / output_j
+  A_dir <- sweep(io$Z, 2, io$output, "/")
+  
+  # ── SYMMETRIZATION VIA AVERAGING ──────────────────────────────────────────
+  # ã_ij = (a_ij + a_ji) / 2
+  # In forma matriciale: A_sym = (A_dir + t(A_dir)) / 2
+  A_sym <- (A_dir + t(A_dir)) / 2
+  
+  # Symmetry check (debug)
+  stopifnot(max(abs(A_sym - t(A_sym))) < 1e-10)
+  
+  # Symmetric adjacency: A[i,j] = 1 if ã_ij > theta
+  Adj <- (A_sym > theta) * 1L
+  diag(Adj) <- 0L
+  
+  # Check adjacency symmetry (debug)
+  stopifnot(max(abs(Adj - t(Adj))) == 0)
+  
+  # Node weights: value-added shares
+  w <- io$VA / sum(io$VA)
+  
+  cat(sprintf("  [SYM CHECK] max|Adj - t(Adj)| = %g  (must be 0)\n",
+              max(abs(Adj - t(Adj)))))
+  
+  list(
+    Adj     = Adj,
+    A_coeff = A_sym,    # coefficiente simmetrico ã
+    A_dir   = A_dir,    # coefficiente direzionale originale (per diagnostica)
+    w       = w,
+    n_edges = sum(Adj) / 2,                          # archi non diretti
+    density = sum(Adj) / 2 / (io$S * (io$S - 1) / 2)
+  )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 5 — CONCENTRATION INDICES
+# ─────────────────────────────────────────────────────────────────────────────
+
+hhi <- function(w) sum(w^2)
+
+gini <- function(w) {
+  n <- length(w); w <- sort(w)
+  2 * sum(seq_len(n) * w) / (n * sum(w)) - (n + 1) / n
+}
+
+nci_base <- function(w, A) {
+  d <- 1 - hhi(w)
+  if (d <= 1e-10) stop("1 - HHI troppo piccolo")
+  as.numeric(t(w) %*% A %*% w) / d
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 6 — BASE YEAR 2014, theta = 0.01
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n=== Base year: 2014, theta = 0.01 ===\n")
+
+YEAR_BASE  <- 2014
+THETA_BASE <- 0.01
+
+io_base  <- extract_year(wiot_raw, YEAR_BASE)
+net_base <- build_network(io_base, THETA_BASE)
+
+H   <- hhi(net_base$w)
+G   <- gini(net_base$w)
+NCI <- nci_base(net_base$w, net_base$Adj)
+
+cat(sprintf("\n  HHI  = %.4f\n  Gini = %.4f\n  NCI  = %.4f\n", H, G, NCI))
+cat(sprintf("  Edges (undirected): %d  |  Density: %.4f\n",
+            net_base$n_edges, net_base$density))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 7 — FIGURE 1: INDEX BARPLOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+idx_df <- data.frame(
+  Measure = factor(c("NCI (Baseline)", "Gini", "HHI"),
+                   levels = c("HHI", "Gini", "NCI (Baseline)")),
+  Value   = c(NCI, G, H),
+  col     = c("#2166ac", "#7b3294", "#b35806")
+)
+
+fig1 <- ggplot(idx_df, aes(x = Value, y = Measure, fill = Measure)) +
+  geom_col(width = 0.55, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.4f", Value)),
+            hjust = -0.12, size = 4.2, fontface = "bold", colour = "grey20") +
+  scale_fill_manual(values = c(
+    "NCI (Baseline)" = "#2166ac",
+    "Gini"           = "#7b3294",
+    "HHI"            = "#b35806")) +
+  scale_x_continuous(limits = c(0, max(NCI, G, H) * 1.35), expand = c(0, 0)) +
+  labs(
+    title ="",
+    x = "Index value", y = NULL
+  ) +
+  theme_nci() +
+  theme(
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(face = "bold", size = 12),
+    axis.text.x        = element_text(face = "bold",size=12),
+    axis.title.x       = element_text(face = "bold")
+  )
+
+print(fig1)
+
+ggsave("Indici_prodotti.jpg", fig1, width = 5, height = 5, dpi = 600, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 8 — FIGURE 2: PRODUCTION NETWORK
+#  Undirected (symmetric) graph — no arrows
+# ─────────────────────────────────────────────────────────────────────────────
+build_net_plot <- function(Adj, w, sector_meta, seed = 42,
+                           top_label = 20, title_extra = "") {
+  
+  S <- nrow(Adj)
+  g <- graph_from_adjacency_matrix(Adj, mode = "undirected", diag = FALSE)
+  deg <- degree(g, mode = "all")
+  
+  set.seed(seed)
+  lay <- layout_with_fr(g, niter = 5000, weights = rep(1, ecount(g)))
+  
+  for (d in 1:2) {
+    rng <- range(lay[, d])
+    if (diff(rng) > 1e-9)
+      lay[, d] <- (lay[, d] - rng[1]) / diff(rng) * 0.82 + 0.12
+  }
+  
+  isolated <- which(deg == 0)
+  n_iso    <- length(isolated)
+  
+  if (n_iso > 0) {
+    lay[, 2] <- lay[, 2] * 0.72 + 0.28
+    margin_x  <- 0.04
+    spacing_x <- (1 - 2 * margin_x) / max(n_iso - 1, 1)
+    lay[isolated, 1] <- margin_x + (seq_len(n_iso) - 1) * spacing_x
+    lay[isolated, 2] <- 0.12
+  }
+  
+  node_size <- rescale(w, to = c(4, 18))
+  rnk       <- rank(-w)
+  
+  df_nodes <- data.frame(
+    x        = lay[, 1],
+    y        = lay[, 2],
+    size     = node_size,
+    macro    = sector_meta$macro,
+    label    = sector_meta$label,
+    weight   = w,
+    rank     = rnk,
+    deg      = deg,
+    isolated = deg == 0
+  )
+  
+  el <- as_edgelist(g, names = FALSE)
+  df_edges <- if (nrow(el) > 0) {
+    data.frame(
+      x    = lay[el[,1], 1], y    = lay[el[,1], 2],
+      xend = lay[el[,2], 1], yend = lay[el[,2], 2]
+    )
+  } else {
+    data.frame(x=numeric(0), y=numeric(0), xend=numeric(0), yend=numeric(0))
+  }
+  
+  # ── All connected top_label nodes → ALWAYS external label with repel ──────
+  df_label_all <- df_nodes[df_nodes$rank <= top_label & !df_nodes$isolated, ]
+  df_isolated  <- df_nodes[df_nodes$isolated, ]
+  
+  ggplot() +
+    # ── Edges ────────────────────────────────────────────────────────────────
+    geom_segment(
+      data      = df_edges,
+      aes(x=x, y=y, xend=xend, yend=yend),
+      colour    = "grey45", linewidth = 0.50, alpha = 0.65
+    ) +
+    # ── Node halo ───────────────────────────────────────────────────────────
+    geom_point(
+      data = df_nodes, aes(x=x, y=y, size=size + 3),
+      colour = "grey15", show.legend = FALSE
+    ) +
+    # ── Nodo colorato ────────────────────────────────────────────────────────
+    geom_point(
+      data  = df_nodes, aes(x=x, y=y, size=size, colour=macro),
+      alpha = 0.92, show.legend = TRUE
+    ) +
+    # ── ALL connected labels: repel only, no label inside the node ───────────
+    # bg.color guarantees readability in all cases
+    ggrepel::geom_text_repel(
+      data               = df_label_all,
+      aes(x=x, y=y, label=label),
+      size               = 2.7,
+      colour             = "grey10",
+      fontface           = "bold",
+      segment.size       = 0.30,
+      segment.colour     = "grey40",
+      segment.curvature  = 0.1,
+      min.segment.length = 0.0,
+      box.padding        = 0.55,      # spazio attorno alla label
+      point.padding      = 0.40,      # distanza minima dal nodo
+      force              = 8,         # repulsione label-label alta
+      force_pull         = 0.5,       # attrazione verso il nodo
+      max.iter           = 10000,     # più iterazioni = più preciso
+      max.overlaps       = Inf,
+      seed               = seed,
+      ylim               = c(0.26, NA),
+      bg.color           = "white",
+      bg.r               = 0.14
+    ) +
+    # ── Isolated node labels ───────────────────────────────────────────────────
+    ggrepel::geom_text_repel(
+      data               = df_isolated,
+      aes(x=x, y=y, label=label),
+      size               = 2.6,
+      colour             = "grey10",
+      fontface           = "bold",
+      segment.size       = 0.25,
+      segment.colour     = "grey55",
+      min.segment.length = 0,
+      box.padding        = 0.5,
+      point.padding      = 0.3,
+      force              = 4,
+      force_pull         = 0.2,
+      direction          = "x",
+      nudge_y            = -0.055,
+      ylim               = c(NA, 0.10),
+      max.overlaps       = Inf,
+      seed               = seed,
+      bg.color           = "white",
+      bg.r               = 0.15
+    ) +
+    scale_colour_manual(values = pal_macro, name = "Sector") +
+    scale_size_identity() +
+    scale_x_continuous(limits = c(0, 1), expand = c(0.03, 0.03)) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0.03, 0.03)) +
+    coord_fixed(1, clip = "off") +
+    labs(title = "") +
+    guides(colour = guide_legend(nrow=2, byrow=TRUE,
+                                 override.aes=list(size=5))) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.subtitle    = element_text(size=8.5, colour="grey35", hjust=0.5),
+      legend.position  = "bottom",
+      legend.direction = "horizontal",
+      legend.title     = element_text(face="bold", size=9),
+      legend.text      = element_text(face="bold", size=8),
+      legend.key.size  = unit(0.55, "cm"),
+      legend.spacing.x = unit(0.3, "cm"),
+      plot.background  = element_rect(fill="white", colour=NA),
+      plot.margin      = margin(10, 10, 15, 10)
+    )
+}
+
+fig2 <- build_net_plot(net_base$Adj, net_base$w, sector_meta,
+                       seed = 42, top_label = 22)
+print(fig2)
+ggsave("Net_prodotti.png", fig2, width = 15, height = 10, dpi = 300, bg = "white")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 9 — FIGURE 3: SENSITIVITY TO THETA
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n=== Sensitivity to theta ===\n")
+
+theta_grid <- c(0.001, 0.003, 0.005, seq(0.007, 0.05, by=0.003),
+                seq(0.06, 0.12, by=0.01))
+
+theta_df <- bind_rows(lapply(theta_grid, function(th) {
+  tryCatch({
+    net_th <- build_network(io_base, theta=th)
+    data.frame(
+      theta   = th,
+      NCI     = nci_base(net_th$w, net_th$Adj),
+      HHI     = hhi(net_th$w),
+      Gini    = gini(net_th$w),
+      density = net_th$density,
+      n_edges = net_th$n_edges
+    )
+  }, error = function(e) {
+    cat(sprintf("  theta=%.4f: %s\n", th, conditionMessage(e)))
+    NULL
+  })
+}))
+
+cat("  Risultati theta:\n"); print(theta_df, digits=4)
+
+theta_long <- theta_df |>
+  pivot_longer(c(NCI, HHI, Gini), names_to="Index", values_to="Value") |>
+  mutate(
+    Index = recode(Index, "NCI"="NCI (Baseline)"),
+    Index = factor(Index, levels=c("NCI (Baseline)","HHI","Gini"))
+  )
+
+fig3 <- ggplot(theta_long, aes(x=theta, y=Value, colour=Index, linetype=Index)) +
+  geom_line(linewidth=0.9) +
+  geom_point(size=2.0) +
+  scale_colour_manual(values=pal_idx) +
+  scale_linetype_manual(values=c(
+    "NCI (Baseline)"="solid","HHI"="dashed","Gini"="dotdash")) +
+  scale_x_log10(
+    breaks = c(0.0005,0.001,0.005,0.01,0.05,0.10),
+    labels = c("0.0005","0.001","0.005","0.01","0.05","0.10")
+  )+
+  labs(
+    x = expression(bold("Network threshold  θ")),
+    y = "Index value", colour=NULL, linetype=NULL
+  ) +
+  theme_nci() +
+  theme(axis.title=element_text(face="bold",size=12),
+        axis.text=element_text(face="bold",size=12),
+        legend.text=element_text(face="bold", size=11),
+        legend.position="bottom")
+
+print(fig3)
+
+ggsave("Evolution_NCI_prootti.png", fig3, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 10 — FIGURE 4: WEIGHT DISTRIBUTION w_i
+# ─────────────────────────────────────────────────────────────────────────────
+
+wt_df <- data.frame(
+  label = factor(sector_meta$label,
+                 levels=sector_meta$label[order(net_base$w, decreasing=TRUE)]),
+  macro = sector_meta$macro,
+  w     = net_base$w
+) |> arrange(desc(w))
+
+fig4 <- ggplot(wt_df, aes(x=label, y=w, fill=macro)) +
+  geom_col(colour="white", linewidth=0.15, width=0.82) +
+  scale_fill_manual(values=pal_macro, name="Sector") +
+  scale_y_continuous(labels=scales::percent_format(accuracy=0.1)) +
+  labs(
+    x=NULL, y=expression(bold(omega[i]))
+  ) +
+  theme_nci() +
+  theme(axis.text.x=element_text(angle=65, hjust=1, size=9,face="bold"),
+        axis.text.y=element_text(size=10,face="bold"),
+        axis.title.y=element_text(face="bold",size=15),
+        legend.text=element_text(face="bold", size=11),
+        legend.title =element_text(face="bold", size=13),
+        legend.position="right")
+
+print(fig4)
+
+ggsave("Weight_prootti.png", fig4, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 11 — FIGURE 5: INDICES ACROSS ALL YEARS
+# ─────────────────────────────────────────────────────────────────────────────
+
+if (length(years_avail) > 1) {
+  
+  cat("\n=== Computing indices for all years ===\n")
+  
+  year_res <- bind_rows(lapply(years_avail, function(yr) {
+    tryCatch({
+      io_yr  <- extract_year(wiot_raw, yr)
+      net_yr <- build_network(io_yr, THETA_BASE)
+      data.frame(
+        Year    = yr,
+        NCI     = nci_base(net_yr$w, net_yr$Adj),
+        HHI     = hhi(net_yr$w),
+        Gini    = gini(net_yr$w),
+        n_edges = net_yr$n_edges,
+        density = net_yr$density
+      )
+    }, error = function(e) {
+      cat(sprintf("  Year %d error: %s\n", yr, conditionMessage(e)))
+      NULL
+    })
+  }))
+  
+  cat("\n=== Indices by year ===\n")
+  print(year_res, digits=4)
+  
+  yr_long <- year_res |>
+    pivot_longer(c(NCI,HHI,Gini), names_to="Index", values_to="Value") |>
+    mutate(Index=recode(Index,"NCI"="NCI (Baseline)"),
+           Index=factor(Index, levels=c("NCI (Baseline)","HHI","Gini")))
+  
+  fig5 <- ggplot(yr_long, aes(x=Year, y=Value, colour=Index, shape=Index)) +
+    geom_line(linewidth=0.9) +
+    geom_point(size=2.5) +
+    scale_colour_manual(values=pal_idx) +
+    scale_x_continuous(breaks=years_avail) +
+    labs(
+      subtitle = sprintf("θ = %.3f | w_i = VA share | symmetric network",
+                         THETA_BASE),
+      x="Year", y="Index value", colour=NULL, shape=NULL
+    ) +
+    theme_nci() +
+    theme(axis.text=element_text(face="bold"),
+          legend.text=element_text(face="bold"),
+          axis.text.x=element_text(angle=45, hjust=1))
+  
+  print(fig5)
+  
+  ggsave(file.path(out_dir,"fig5_indices_over_time.pdf"),
+         fig5, width=9, height=5, dpi=300)
+  ggsave(file.path(out_dir,"fig5_indices_over_time.jpg"),
+         fig5, width=9, height=5, dpi=600, bg="white")
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 12 — SALVATAGGIO
+# ─────────────────────────────────────────────────────────────────────────────
+
+out_dir <- "/mnt/user-data/outputs"
+dir.create(out_dir, showWarnings=FALSE)
+
+ggsave(file.path(out_dir,"fig1_concentration_indices.pdf"), fig1, width=7,  height=3.5, dpi=300)
+ggsave(file.path(out_dir,"fig1_concentration_indices.jpg"), fig1, width=7,  height=3.5, dpi=600, bg="white")
+ggsave(file.path(out_dir,"fig2_production_network.pdf"),    fig2, width=11, height=10,  dpi=300)
+ggsave(file.path(out_dir,"fig2_production_network.png"),    fig2, width=11, height=10,  dpi=300, bg="white")
+ggsave(file.path(out_dir,"fig3_nci_hhi_gini_vs_theta.pdf"), fig3, width=8,  height=5,   dpi=300)
+ggsave(file.path(out_dir,"fig3_nci_hhi_gini_vs_theta.jpg"), fig3, width=8,  height=5,   dpi=600, bg="white")
+ggsave(file.path(out_dir,"fig4_sector_weights.pdf"),        fig4, width=12, height=5,   dpi=300)
+ggsave(file.path(out_dir,"fig4_sector_weights.jpg"),        fig4, width=12, height=5,   dpi=600, bg="white")
+
+cat(sprintf("\nFile salvati in: %s\n", out_dir))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 13 — OUTPUT LATEX
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n% ─── LaTeX ──────────────────────────────────────────────────────────────────\n")
+cat("\\begin{table}[h]\n\\centering\n")
+cat(sprintf(
+  "\\caption{Concentration measures for the symmetric production network (WIOD %d, $\\theta = %.3f$)}\n",
+  YEAR_BASE, THETA_BASE))
+cat("\\label{tab:production_results}\n")
+cat("\\begin{tabular}{lc}\\hline\n")
+cat("Measure & Value \\\\\n\\hline\n")
+cat(sprintf("Herfindahl--Hirschman Index (HHI) & %.4f \\\\\n", H))
+cat(sprintf("Gini Coefficient                  & %.4f \\\\\n", G))
+cat(sprintf("Network Concentration Index (NCI) & %.4f \\\\\n", NCI))
+cat("\\hline\n\\end{tabular}\n\\end{table}\n")
+
+cat("\n=== Completato ===\n")e
