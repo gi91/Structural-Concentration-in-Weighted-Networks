@@ -25,7 +25,16 @@
 #   the OR (union) rule and more informative than AND (intersection).
 # =============================================================================
 
-load("D:/Nuovo Indice NCI/Dati WIOTS/WIOTS_in_R/WIOT2014_October16_ROW.RData")
+########################################################################
+#  DATA AVAILABILITY
+#  The WIOD 2016-release input-output tables (R format, WIOT2014
+#  October 2016 ROW) are freely available at:
+#    https://www.rug.nl/ggdc/valuechain/wiod/wiod-2016-release
+#  Download "WIOT tables in R format" and load the 2014 table, e.g.:
+#    load("path/to/WIOT2014_October16_ROW.RData")
+#  or set WIOD_PATH below to the .RData file location.
+########################################################################
+# load("path/to/WIOT2014_October16_ROW.RData")   # <- set your local path
 
 suppressPackageStartupMessages({
   library(data.table)
@@ -153,7 +162,7 @@ WIOD_PATH <- NULL
 
 load_wiot <- function(path = WIOD_PATH) {
   if (exists("wiot", envir = .GlobalEnv)) {
-    cat("  [OK] Oggetto 'wiot' trovato in memoria.\n")
+    cat("  [OK] Object 'wiot' found in memory.\n")
     return(as.data.table(get("wiot", envir = .GlobalEnv)))
   }
   if (!is.null(path) && file.exists(path)) {
@@ -166,10 +175,10 @@ load_wiot <- function(path = WIOD_PATH) {
     }
     if (ext == "csv") return(fread(path))
   }
-  stop("Dataset WIOD non trovato.")
+  stop("WIOD dataset not found. Data freely available at: https://www.rug.nl/ggdc/valuechain/wiod/wiod-2016-release")
 }
 
-cat("=== Caricamento WIOT ===\n")
+cat("=== Loading WIOT ===\n")
 wiot_raw <- load_wiot()
 cat(sprintf("  Dimensions: %d × %d\n\n", nrow(wiot_raw), ncol(wiot_raw)))
 
@@ -267,7 +276,7 @@ extract_country_year <- function(dt, yr) {
 #    ã[c,d]  = (a[c,d] + a[d,c]) / 2   (average bidirectional intensity)
 #
 #  Symmetric adjacency:
-#    A[c,d] = A[d,c] = 1  se  ã[c,d] > theta
+#    A[c,d] = A[d,c] = 1  if  ã[c,d] > theta
 #
 #  Interpretation: a link exists if ON AVERAGE the two countries exchange
 #  intermediate inputs to a relevant extent — neither one direction alone (OR)
