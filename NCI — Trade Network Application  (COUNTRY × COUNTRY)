@@ -1,0 +1,749 @@
+# =============================================================================
+#  NCI — Trade Network Application  (COUNTRY × COUNTRY)
+#  World Input-Output Database (WIOD), 2016 Release
+#  Current prices, millions of USD
+#
+#  Riso & Zoia (2026) — Empirical Application: International Trade Networks
+#
+#  Logica:
+#   Nodes  = countries (44 + ROW = 45)
+#   Edges  = intermediate flows aggregated over all sectors
+#             ã[c,d] = (a[c,d] + a[d,c]) / 2   (average bidirectional coefficient)
+#             A[c,d] = 1  if  ã[c,d] > theta    (SYMMETRIC matrix)
+#   Weights = w_c = VA_c / sum(VA)   (world value-added share by country)
+#   Indices = Baseline NCI  vs  HHI  vs  Gini
+#
+#  Economic interpretation:
+#   HHI  → concentration of world VA (how large each country is)
+#   NCI  → are the largest countries also the most interconnected?
+#           NCI >> HHI  ⟹  trade hubs coincide with the dominant countries
+#
+#  Note on symmetrization:
+#   ã[c,d] = (a[c,d] + a[d,c]) / 2  captures the AVERAGE intensity of the
+#   bidirectional trade between c and d. An edge exists if both
+#   directions are on average relevant. This is more conservative than
+#   the OR (union) rule and more informative than AND (intersection).
+# =============================================================================
+
+load("D:/Nuovo Indice NCI/Dati WIOTS/WIOTS_in_R/WIOT2014_October16_ROW.RData")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(igraph)
+  library(scales)
+  library(ggrepel)
+  library(maps)
+})
+
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+
+set.seed(42)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GRAPHICAL THEME
+# ─────────────────────────────────────────────────────────────────────────────
+
+theme_nci <- function(base = 11) {
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(colour = "grey92", linewidth = 0.3),
+      strip.background  = element_rect(fill = "grey95", colour = "grey75"),
+      strip.text        = element_text(face = "bold", size = base - 1),
+      plot.title        = element_text(face = "bold", size = base + 1, hjust = 0),
+      plot.subtitle     = element_text(size = base - 2, colour = "grey45"),
+      axis.title        = element_text(size = base - 1),
+      legend.position   = "bottom",
+      legend.key.size   = unit(0.45, "cm"),
+      legend.text       = element_text(size = base - 2),
+      plot.margin       = margin(8, 12, 8, 8)
+    )
+}
+
+pal_region <- c(
+  "North America"  = "#2166ac",
+  "Europe West"    = "#4dac26",
+  "Europe East"    = "#b8e186",
+  "East Asia"      = "#d6604d",
+  "South/SE Asia"  = "#f4a582",
+  "Latin America"  = "#7b3294",
+  "Oceania"        = "#1a9850",
+  "Middle East"    = "#b35806",
+  "Rest of World"  = "grey55"
+)
+
+pal_idx <- c(
+  "NCI (Baseline)" = "#2166ac",
+  "HHI"            = "#b35806",
+  "Gini"           = "#7b3294"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WIOD 2016 COUNTRY METADATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+country_meta <- data.frame(
+  code = c("AUS","AUT","BEL","BGR","BRA","CAN","CHE","CHN","CYP","CZE",
+           "DEU","DNK","ESP","EST","FIN","FRA","GBR","GRC","HRV","HUN",
+           "IDN","IND","IRL","ITA","JPN","KOR","LTU","LUX","LVA","MEX",
+           "MLT","NLD","NOR","POL","PRT","ROU","RUS","SVK","SVN","SWE",
+           "TUR","TWN","USA","ROW"),
+  name = c("Australia","Austria","Belgium","Bulgaria","Brazil","Canada",
+           "Switzerland","China","Cyprus","Czech Rep.",
+           "Germany","Denmark","Spain","Estonia","Finland","France",
+           "UK","Greece","Croatia","Hungary",
+           "Indonesia","India","Ireland","Italy","Japan","South Korea",
+           "Lithuania","Luxembourg","Latvia","Mexico",
+           "Malta","Netherlands","Norway","Poland","Portugal","Romania",
+           "Russia","Slovakia","Slovenia","Sweden",
+           "Turkey","Taiwan","USA","Rest of World"),
+  region = c(
+    "Oceania","Europe West","Europe West","Europe East","Latin America",
+    "North America","Europe West","East Asia","Europe West","Europe East",
+    "Europe West","Europe West","Europe West","Europe East","Europe West",
+    "Europe West","Europe West","Europe West","Europe East","Europe East",
+    "South/SE Asia","South/SE Asia","Europe West","Europe West","East Asia",
+    "East Asia","Europe East","Europe West","Europe East","Latin America",
+    "Europe West","Europe West","Europe West","Europe East","Europe West",
+    "Europe East","Europe East","Europe East","Europe East","Europe West",
+    "Middle East","East Asia","North America","Rest of World"
+  ),
+  lon = c(133,-14, 4.5, 25,-55,-96, 8,104, 33, 16,
+          10, 10, -4, 25, 26,  2, -2, 22, 16, 19,
+          118, 78,-8, 12,138,128, 24,  6, 24,-102,
+          14,  5, 10, 20, -8, 25, 37, 19, 15, 18,
+          35,121,-97,  0),
+  lat = c(-27, 47, 51, 43,-10, 60, 47, 35, 35, 50,
+          51, 56, 40, 59, 62, 47, 54, 38, 45, 47,
+          -5, 22, 53, 43, 37, 36, 56, 50, 57, 23,
+          36, 52, 62, 52, 39, 46, 60, 49, 46, 60,
+          39, 24, 40,  0),
+  stringsAsFactors = FALSE
+)
+
+N_COUNTRIES <- nrow(country_meta)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WIOD SECTOR CODES (56)
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIOD56 <- c(
+  "A01","A02","A03","B",
+  "C10-C12","C13-C15","C16","C17","C18","C19","C20","C21",
+  "C22","C23","C24","C25","C26","C27","C28","C29","C30","C31_C32","C33",
+  "D35","E36","E37-E39","F",
+  "G45","G46","G47",
+  "H49","H50","H51","H52","H53","I",
+  "J58","J59_J60","J61","J62_J63",
+  "K64","K65","K66","L68",
+  "M69_M70","M71","M72","M73_M74","M75","N",
+  "O84","P85","Q","R_S","T","U"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1 — LOAD WIOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+WIOD_PATH <- NULL
+
+load_wiot <- function(path = WIOD_PATH) {
+  if (exists("wiot", envir = .GlobalEnv)) {
+    cat("  [OK] Oggetto 'wiot' trovato in memoria.\n")
+    return(as.data.table(get("wiot", envir = .GlobalEnv)))
+  }
+  if (!is.null(path) && file.exists(path)) {
+    ext <- tolower(tools::file_ext(path))
+    if (ext %in% c("rdata","rda")) {
+      env <- new.env(); load(path, envir = env)
+      obj <- ls(env)[1]
+      cat(sprintf("  [OK] Loaded '%s' from %s\n", obj, path))
+      return(as.data.table(get(obj, envir = env)))
+    }
+    if (ext == "csv") return(fread(path))
+  }
+  stop("Dataset WIOD non trovato.")
+}
+
+cat("=== Caricamento WIOT ===\n")
+wiot_raw <- load_wiot()
+cat(sprintf("  Dimensions: %d × %d\n\n", nrow(wiot_raw), ncol(wiot_raw)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — COLUMN PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+all_cols    <- names(wiot_raw)
+inter_cols  <- grep("^[A-Z]{3}[0-9]+$", all_cols, value = TRUE)
+col_ctry    <- substr(inter_cols, 1, 3)
+col_sectnum <- as.integer(sub("^[A-Z]{3}", "", inter_cols))
+
+ok          <- col_sectnum >= 1 & col_sectnum <= 56
+inter_cols  <- inter_cols[ok]
+col_ctry    <- col_ctry[ok]
+col_sectnum <- col_sectnum[ok]
+
+countries_in_cols <- unique(col_ctry)
+cat(sprintf("Countries in columns: %d → %s\n\n",
+            length(countries_in_cols),
+            paste(countries_in_cols, collapse = " ")))
+
+countries_ordered <- countries_in_cols
+C <- length(countries_ordered)
+
+country_meta <- country_meta[country_meta$code %in% countries_ordered, ]
+extra <- setdiff(countries_ordered, country_meta$code)
+if (length(extra) > 0) {
+  extra_df <- data.frame(code=extra, name=extra, region="Rest of World",
+                         lon=0, lat=0, stringsAsFactors=FALSE)
+  country_meta <- rbind(country_meta, extra_df)
+}
+country_meta <- country_meta[match(countries_ordered, country_meta$code), ]
+rownames(country_meta) <- NULL
+cat(sprintf("Countries in the model: %d\n", nrow(country_meta)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — EXTRACT Z_country AND VA_country FOR A GIVEN YEAR
+# ─────────────────────────────────────────────────────────────────────────────
+
+extract_country_year <- function(dt, yr) {
+  
+  d <- dt[Year == yr]
+  sect_rows <- d[IndustryCode %in% WIOD56 & RNr %in% 1:56]
+  cat(sprintf("  Year %d | sectoral rows: %d\n", yr, nrow(sect_rows)))
+  
+  Z_raw <- as.matrix(sect_rows[, ..inter_cols])
+  Z_raw[is.na(Z_raw) | Z_raw < 0] <- 0
+  row_ctry <- sect_rows$Country
+  
+  Z_ctry <- matrix(0, C, C, dimnames = list(countries_ordered, countries_ordered))
+  for (c_idx in seq_len(C)) {
+    c_code <- countries_ordered[c_idx]
+    rows_c <- which(row_ctry == c_code)
+    if (length(rows_c) == 0) next
+    for (d_idx in seq_len(C)) {
+      d_code <- countries_ordered[d_idx]
+      cols_d <- which(col_ctry == d_code)
+      if (length(cols_d) == 0) next
+      Z_ctry[c_idx, d_idx] <- sum(Z_raw[rows_c, cols_d])
+    }
+  }
+  diag(Z_ctry) <- 0
+  
+  va_rows <- d[!IndustryCode %in% WIOD56 & RNr > 56]
+  VA_ctry <- numeric(C)
+  
+  if (nrow(va_rows) > 0) {
+    VA_raw <- as.matrix(va_rows[, ..inter_cols])
+    VA_raw[is.na(VA_raw) | VA_raw < 0] <- 0
+    for (d_idx in seq_len(C)) {
+      cols_d <- which(col_ctry == countries_ordered[d_idx])
+      if (length(cols_d) > 0)
+        VA_ctry[d_idx] <- sum(VA_raw[, cols_d])
+    }
+    cat(sprintf("  VA extracted from %d non-sectoral rows\n", nrow(va_rows)))
+  } else {
+    cat("  No VA row — residual proxy\n")
+    VA_ctry <- colSums(Z_ctry) * 0.8
+  }
+  
+  VA_ctry[VA_ctry <= 0] <- 1e-6
+  output_d <- colSums(Z_ctry) + VA_ctry
+  output_d[output_d <= 0] <- 1
+  
+  list(Z=Z_ctry, VA=VA_ctry, output=output_d, C=C, year=yr)
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4 — SYMMETRIC NETWORK CONSTRUCTION
+#
+#  Symmetrization via the AVERAGE of the technical coefficients:
+#    a[c,d]  = Z[c,d] / output[d]   (direct: c supplies d)
+#    a[d,c]  = Z[d,c] / output[c]   (reverse: d supplies c)
+#    ã[c,d]  = (a[c,d] + a[d,c]) / 2   (average bidirectional intensity)
+#
+#  Symmetric adjacency:
+#    A[c,d] = A[d,c] = 1  se  ã[c,d] > theta
+#
+#  Interpretation: a link exists if ON AVERAGE the two countries exchange
+#  intermediate inputs to a relevant extent — neither one direction alone (OR)
+#  suffices, nor must both be strong (AND). It is the most balanced choice.
+#
+#  Check: max(abs(Adj - t(Adj))) == 0  must be TRUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+build_country_net <- function(io, theta = 0.005) {
+  
+  # Coefficienti tecnici direzionali: a[c,d] = Z[c,d] / output[d]
+  A_dir <- sweep(io$Z, 2, io$output, "/")
+  
+  # ── SYMMETRIZATION VIA AVERAGING ──────────────────────────────────────────
+  # ã[c,d] = (a[c,d] + a[d,c]) / 2
+  # In forma matriciale: A_sym = (A_dir + t(A_dir)) / 2
+  A_sym <- (A_dir + t(A_dir)) / 2
+  
+  # Symmetry check (debug)
+  stopifnot(max(abs(A_sym - t(A_sym))) < 1e-10)
+  
+  # Symmetric adjacency: A[c,d] = 1 if ã[c,d] > theta
+  Adj <- (A_sym > theta) * 1L
+  diag(Adj) <- 0L
+  
+  # Check adjacency symmetry (debug)
+  stopifnot(max(abs(Adj - t(Adj))) == 0)
+  
+  # Node weights: world VA shares
+  w <- io$VA / sum(io$VA)
+  
+  cat(sprintf("  [SYM CHECK] max|Adj - t(Adj)| = %g  (must be 0)\n",
+              max(abs(Adj - t(Adj)))))
+  
+  list(
+    Adj     = Adj,
+    A_coeff = A_sym,   # ora esportiamo il coefficiente simmetrico
+    A_dir   = A_dir,   # manteniamo anche quello direzionale per diagnostica
+    w       = w,
+    n_edges = sum(Adj) / 2,          # archi non diretti (dividiamo per 2)
+    density = sum(Adj) / 2 / (io$C * (io$C - 1) / 2)
+  )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 5 — INDICES
+# ─────────────────────────────────────────────────────────────────────────────
+
+hhi      <- function(w) sum(w^2)
+gini     <- function(w) {
+  n <- length(w); w <- sort(w)
+  2 * sum(seq_len(n) * w) / (n * sum(w)) - (n + 1) / n
+}
+nci_base <- function(w, A) {
+  d <- 1 - hhi(w)
+  if (d <= 1e-10) stop("1 - HHI troppo piccolo")
+  as.numeric(t(w) %*% A %*% w) / d
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 6 — BASE YEAR 2014, theta = 0.005
+# ─────────────────────────────────────────────────────────────────────────────
+
+YEAR_BASE  <- 2014
+THETA_BASE <- 0.005
+
+cat(sprintf("\n=== Base year: %d, theta = %.4f ===\n", YEAR_BASE, THETA_BASE))
+
+io_base  <- extract_country_year(wiot_raw, YEAR_BASE)
+net_base <- build_country_net(io_base, THETA_BASE)
+
+H   <- hhi(net_base$w)
+G   <- gini(net_base$w)
+NCI <- nci_base(net_base$w, net_base$Adj)
+
+cat(sprintf("\n  HHI  = %.4f\n  Gini = %.4f\n  NCI  = %.4f\n", H, G, NCI))
+cat(sprintf("  Edges (undirected): %d  |  Density: %.4f\n",
+            net_base$n_edges, net_base$density))
+
+top10_w  <- sort(net_base$w, decreasing = TRUE)[1:10]
+top10_df <- data.frame(
+  Country  = country_meta$name[order(-net_base$w)][1:10],
+  Code     = country_meta$code[order(-net_base$w)][1:10],
+  VA_share = round(top10_w * 100, 2)
+)
+cat("\n  Top-10 countries by VA share:\n")
+print(top10_df, row.names = FALSE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 7 — FIGURE 1: INDEX BARPLOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+idx_df <- data.frame(
+  Measure = factor(c("NCI (Baseline)", "Gini", "HHI"),
+                   levels = c("HHI", "Gini", "NCI (Baseline)")),
+  Value   = c(NCI, G, H)
+)
+
+fig1 <- ggplot(idx_df, aes(x = Value, y = Measure, fill = Measure)) +
+  geom_col(width = 0.55, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.4f", Value)),
+            hjust = -0.12, size = 4.2, fontface = "bold", colour = "grey20") +
+  scale_fill_manual(values = c(
+    "NCI (Baseline)" = "#2166ac",
+    "Gini"           = "#7b3294",
+    "HHI"            = "#b35806")) +
+  scale_x_continuous(limits = c(0, max(NCI, G, H) * 1.38), expand = c(0, 0)) +
+  labs(x = "Index value", y = NULL) +
+  theme_nci() +
+  theme(
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(face = "bold", size = 12),
+    axis.text.x        = element_text(face = "bold", size = 12),
+    axis.title.x       = element_text(face = "bold")
+  )
+
+print(fig1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 8 — FIGURE 2: TRADE NETWORK
+#  Network is UNDIRECTED (symmetric) — no arrows, plain segments
+# ─────────────────────────────────────────────────────────────────────────────
+
+build_country_net_plot <- function(Adj, w, country_meta,
+                                   use_geo  = TRUE,
+                                   seed     = 42,
+                                   top_label = 20) {
+  C <- nrow(Adj)
+  
+  # ── Validates and builds the UNDIRECTED graph ─────────────────────────────
+  is_sym <- max(abs(Adj - t(Adj))) == 0
+  if (!is_sym) warning("Adj non simmetrica: verrà forzata a undirected via OR")
+  
+  g <- graph_from_adjacency_matrix(
+    Adj,
+    mode  = "undirected",   # sempre undirected con matrice simmetrica
+    diag  = FALSE
+  )
+  
+  deg_tot <- degree(g, mode = "all")
+  
+  # ── Layout ────────────────────────────────────────────────────────────────
+  if (use_geo) {
+    lon_n <- (country_meta$lon - (-180)) / 360
+    lat_n <- (country_meta$lat - (-90))  / 180
+    set.seed(seed)
+    lay <- cbind(
+      pmin(pmax(lon_n + rnorm(C, 0, 0.004), 0.02), 0.98),
+      pmin(pmax(lat_n + rnorm(C, 0, 0.004), 0.02), 0.98)
+    )
+  } else {
+    set.seed(seed)
+    lay <- layout_with_fr(g, niter = 3000)
+    for (d in 1:2) {
+      rng <- range(lay[, d])
+      if (diff(rng) > 1e-9)
+        lay[, d] <- (lay[, d] - rng[1]) / diff(rng) * 0.90 + 0.05
+    }
+  }
+  
+  node_size <- rescale(w, to = c(3, 18))
+  rnk       <- rank(-w)
+  
+  df_nodes <- data.frame(
+    x      = lay[, 1],
+    y      = lay[, 2],
+    size   = node_size,
+    region = country_meta$region,
+    label  = country_meta$code,
+    name   = country_meta$name,
+    weight = w,
+    rank   = rnk,
+    deg    = deg_tot
+  )
+  
+  # ── Edges: plain segments, no arrows (undirected graph) ───────────────────
+  el <- as_edgelist(g, names = FALSE)
+  df_edges <- if (nrow(el) > 0) {
+    data.frame(
+      x    = lay[el[,1], 1], y    = lay[el[,1], 2],
+      xend = lay[el[,2], 1], yend = lay[el[,2], 2]
+    )
+  } else {
+    data.frame(x=numeric(0), y=numeric(0), xend=numeric(0), yend=numeric(0))
+  }
+  
+  df_label_in  <- df_nodes[df_nodes$rank <= top_label & df_nodes$size >= 9, ]
+  df_label_out <- df_nodes[df_nodes$rank <= top_label & df_nodes$size <  9, ]
+  
+  ggplot() +
+    # Edges — no arrows since the graph is undirected
+    geom_segment(
+      data      = df_edges,
+      aes(x=x, y=y, xend=xend, yend=yend),
+      colour    = "grey45",
+      linewidth = 0.45,
+      alpha     = 0.60
+    ) +
+    # Alone nodo
+    geom_point(
+      data = df_nodes, aes(x=x, y=y, size = size + 3),
+      colour = "grey15", show.legend = FALSE
+    ) +
+    # Node coloured by region
+    geom_point(
+      data = df_nodes, aes(x=x, y=y, size = size, colour = region),
+      alpha = 0.92, show.legend = TRUE
+    ) +
+    # Labels inside large nodes
+    geom_text(
+      data   = df_label_in,
+      aes(x=x, y=y, label=label),
+      colour = "white", fontface = "bold", size = 2.5
+    ) +
+    # External labels for small nodes
+    ggrepel::geom_text_repel(
+      data               = df_label_out,
+      aes(x=x, y=y, label=label),
+      size               = 2.6, colour = "grey10", fontface = "bold",
+      segment.size       = 0.22, segment.colour = "grey55",
+      min.segment.length = 0.06,
+      box.padding        = 0.22, max.overlaps = 30, seed = seed
+    ) +
+    scale_colour_manual(values = pal_region, name = "Region") +
+    scale_size_identity() +
+    scale_x_continuous(limits = c(0, 1), expand = c(0.04, 0.04)) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0.04, 0.04)) +
+    coord_fixed(1, clip = "off") +
+    labs(title = "") +
+    guides(colour = guide_legend(nrow=2, byrow=TRUE,
+                                 override.aes=list(size=5))) +
+    theme_void(base_size = 10) +
+    theme(
+      plot.subtitle    = element_text(size=8.5, colour="grey35", hjust=0.5),
+      legend.position  = "bottom",
+      legend.direction = "horizontal",
+      legend.title     = element_text(face="bold", size=9),
+      legend.text      = element_text(face="bold", size=8),
+      legend.key.size  = unit(0.55, "cm"),
+      legend.spacing.x = unit(0.3, "cm"),
+      plot.background  = element_rect(fill="white", colour=NA),
+      plot.margin      = margin(10, 10, 15, 10)
+    )
+}
+
+fig2_geo <- build_country_net_plot(net_base$Adj, net_base$w, country_meta,
+                                   use_geo=TRUE,  seed=42, top_label=20)
+fig2_fr  <- build_country_net_plot(net_base$Adj, net_base$w, country_meta,
+                                   use_geo=FALSE, seed=42, top_label=20)
+print(fig2_geo)
+print(fig2_fr)
+
+ggsave("Net_Paesi.png", fig2_fr, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 9 — FIGURE 3: SENSITIVITY TO THETA
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n=== Sensitivity to theta ===\n")
+
+theta_grid <- c(0.0005, 0.001, 0.002, 0.003, 0.005,
+                seq(0.007, 0.03, by=0.003),
+                seq(0.04,  0.10, by=0.01))
+
+theta_df <- bind_rows(lapply(theta_grid, function(th) {
+  tryCatch({
+    net_th <- build_country_net(io_base, theta=th)
+    data.frame(
+      theta   = th,
+      NCI     = nci_base(net_th$w, net_th$Adj),
+      HHI     = hhi(net_th$w),
+      Gini    = gini(net_th$w),
+      n_edges = net_th$n_edges,
+      density = net_th$density
+    )
+  }, error = function(e) NULL)
+}))
+
+cat("  Risultati theta:\n"); print(theta_df, digits=4)
+
+theta_long <- theta_df |>
+  pivot_longer(c(NCI, HHI, Gini), names_to="Index", values_to="Value") |>
+  mutate(Index = recode(Index, "NCI"="NCI (Baseline)"),
+         Index = factor(Index, levels=c("NCI (Baseline)","HHI","Gini")))
+
+fig3 <- ggplot(theta_long, aes(x=theta, y=Value, colour=Index, linetype=Index)) +
+  geom_line(linewidth=0.9) +
+  geom_point(size=1.9) +
+  scale_colour_manual(values=pal_idx) +
+  scale_linetype_manual(values=c(
+    "NCI (Baseline)"="solid","HHI"="dashed","Gini"="dotdash")) +
+  scale_x_log10(
+    breaks = c(0.0005,0.001,0.005,0.01,0.05,0.10),
+    labels = c("0.0005","0.001","0.005","0.01","0.05","0.10")
+  ) +
+  labs(
+    x = expression(bold("Network threshold  θ")),
+    y = "Index value", colour=NULL, linetype=NULL
+  ) +
+  theme_nci() +
+  theme(axis.title=element_text(face="bold",size=12),
+        axis.text=element_text(face="bold",size=12),
+        legend.text=element_text(face="bold", size=11),
+        legend.position="bottom")
+
+
+print(fig3)
+
+ggsave("Evolution_NCI_paesi.png", fig3, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 10 — FIGURE 4: VA DISTRIBUTION BY COUNTRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+wa_df <- data.frame(
+  code=country_meta$code, name=country_meta$name,
+  region=country_meta$region, w=net_base$w
+) |>
+  arrange(desc(w)) |>
+  mutate(rank=row_number(), name=factor(name, levels=name))
+
+top20_df  <- wa_df[1:20, ]
+other_w   <- sum(wa_df$w[21:nrow(wa_df)])
+other_row <- data.frame(code="OTH", name=factor("Other"),
+                        region="Rest of World", w=other_w, rank=21)
+plot_w_df <- rbind(top20_df, other_row) |>
+  mutate(name=factor(name, levels=rev(as.character(name))))
+
+fig4 <- ggplot(plot_w_df, aes(x=w, y=name, fill=region)) +
+  geom_col(width=0.72, colour="white", linewidth=0.2) +
+  geom_text(aes(label=sprintf("%.2f%%", w*100)),
+            hjust=-0.1, size=3.0, fontface="bold", colour="grey20") +
+  scale_fill_manual(values=pal_region, name="Region") +
+  scale_x_continuous(labels=scales::percent_format(accuracy=0.1),
+                     limits=c(0, max(plot_w_df$w)*1.25), expand=c(0,0)) +
+  labs(
+       x=expression(bold(omega[i])), y=NULL) +
+  theme_nci() +
+  theme(axis.text.x=element_text(angle=65, hjust=1, size=9,face="bold"),
+        axis.text.y=element_text(size=10,face="bold"),
+        axis.title.y=element_text(face="bold",size=15),
+        legend.text=element_text(face="bold", size=11),
+        legend.title =element_text(face="bold", size=13),
+        legend.position="right")
+
+print(fig4)
+
+ggsave("Weight_paesi.png", fig4, width = 15, height = 10, dpi = 300, bg = "white")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 11 — FIGURE 5: HEATMAP COEFFICIENTI SIMMETRICI (top-15)
+#  Shows ã[c,d] = (a[c,d] + a[d,c]) / 2  — symmetric by construction
+# ─────────────────────────────────────────────────────────────────────────────
+
+top15_idx  <- order(-net_base$w)[1:15]
+top15_code <- country_meta$code[top15_idx]
+top15_name <- country_meta$name[top15_idx]
+
+# Uses the symmetric A_coeff (already stored in net_base)
+A_sub <- net_base$A_coeff[top15_idx, top15_idx]
+
+heat_df <- reshape2::melt(A_sub, varnames=c("From","To"), value.name="a_ij") |>
+  mutate(
+    From = factor(From, levels=rev(top15_code), labels=rev(top15_name)),
+    To   = factor(To,   levels=top15_code,      labels=top15_name)
+  )
+
+fig5 <- ggplot(heat_df, aes(x=To, y=From, fill=a_ij)) +
+  geom_tile(colour="white", linewidth=0.4) +
+  geom_text(aes(label=ifelse(a_ij > THETA_BASE, sprintf("%.3f", a_ij), "")),
+            size=2.3, colour="grey10") +
+  scale_fill_gradient2(
+    low="white", mid="#f4a582", high="#d6604d",
+    midpoint=THETA_BASE*3, limits=c(0,NA),
+    name=expression(tilde(a)[cd])   # ã per indicare coefficiente simmetrico
+  ) +
+  labs(
+    subtitle=sprintf(
+      "WIOD %d | Symmetric coeff. ã[c,d] = (a[c,d]+a[d,c])/2 | top-15 by VA",
+      YEAR_BASE),
+    x="Country (column / buyer side)", y="Country (row / supplier side)"
+  ) +
+  theme_nci(base=9) +
+  theme(aspect.ratio=1,
+        axis.text.x=element_text(angle=40, hjust=1, size=7.5),
+        axis.text.y=element_text(size=7.5),
+        axis.title=element_text(face="bold"),
+        legend.position="right")
+
+print(fig5)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 12 — FIGURE 6: INDICES ACROSS ALL YEARS
+# ─────────────────────────────────────────────────────────────────────────────
+
+years_avail <- sort(unique(wiot_raw$Year))
+
+if (length(years_avail) > 1) {
+  cat("\n=== Computing indices for all years ===\n")
+  
+  year_res <- bind_rows(lapply(years_avail, function(yr) {
+    tryCatch({
+      io_yr  <- extract_country_year(wiot_raw, yr)
+      net_yr <- build_country_net(io_yr, THETA_BASE)
+      data.frame(Year=yr,
+                 NCI=nci_base(net_yr$w, net_yr$Adj),
+                 HHI=hhi(net_yr$w),
+                 Gini=gini(net_yr$w),
+                 n_edges=net_yr$n_edges)
+    }, error=function(e) { cat(sprintf("  Year %d: %s\n", yr, e$message)); NULL })
+  }))
+  
+  cat("\n  Indices by year:\n"); print(year_res, digits=4)
+  
+  yr_long <- year_res |>
+    pivot_longer(c(NCI,HHI,Gini), names_to="Index", values_to="Value") |>
+    mutate(Index=recode(Index,"NCI"="NCI (Baseline)"),
+           Index=factor(Index, levels=c("NCI (Baseline)","HHI","Gini")))
+  
+  fig6 <- ggplot(yr_long, aes(x=Year, y=Value, colour=Index, shape=Index)) +
+    geom_line(linewidth=0.9) +
+    geom_point(size=2.5) +
+    scale_colour_manual(values=pal_idx) +
+    scale_x_continuous(breaks=years_avail) +
+    labs(subtitle=sprintf("θ = %.4f | w_c = VA share | symmetric network", THETA_BASE),
+         x="Year", y="Index value", colour=NULL, shape=NULL) +
+    theme_nci() +
+    theme(axis.text.x=element_text(angle=45, hjust=1, face="bold"),
+          legend.text=element_text(face="bold"))
+  
+  print(fig6)
+  
+  ggsave(file.path(out_dir,"fig6_country_indices_time.pdf"),
+         fig6, width=9, height=5, dpi=300)
+  ggsave(file.path(out_dir,"fig6_country_indices_time.jpg"),
+         fig6, width=9, height=5, dpi=600, bg="white")
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 13 — SALVATAGGIO
+# ─────────────────────────────────────────────────────────────────────────────
+
+out_dir <- "/mnt/user-data/outputs"
+dir.create(out_dir, showWarnings=FALSE)
+
+ggsave(file.path(out_dir,"figC1_country_indices.pdf"),   fig1,     width=7,  height=3.5, dpi=300)
+ggsave(file.path(out_dir,"figC1_country_indices.jpg"),   fig1,     width=7,  height=3.5, dpi=600, bg="white")
+ggsave(file.path(out_dir,"figC2_trade_network_geo.pdf"), fig2_geo, width=12, height=7,   dpi=300)
+ggsave(file.path(out_dir,"figC2_trade_network_geo.png"), fig2_geo, width=12, height=7,   dpi=300, bg="white")
+ggsave(file.path(out_dir,"figC2_trade_network_fr.pdf"),  fig2_fr,  width=11, height=10,  dpi=300)
+ggsave(file.path(out_dir,"figC2_trade_network_fr.png"),  fig2_fr,  width=11, height=10,  dpi=300, bg="white")
+ggsave(file.path(out_dir,"figC3_nci_vs_theta.pdf"),      fig3,     width=8,  height=5,   dpi=300)
+ggsave(file.path(out_dir,"figC3_nci_vs_theta.jpg"),      fig3,     width=8,  height=5,   dpi=600, bg="white")
+ggsave(file.path(out_dir,"figC4_country_weights.pdf"),   fig4,     width=8,  height=7,   dpi=300)
+ggsave(file.path(out_dir,"figC4_country_weights.jpg"),   fig4,     width=8,  height=7,   dpi=600, bg="white")
+ggsave(file.path(out_dir,"figC5_flow_heatmap.pdf"),      fig5,     width=8,  height=8,   dpi=300)
+ggsave(file.path(out_dir,"figC5_flow_heatmap.jpg"),      fig5,     width=8,  height=8,   dpi=600, bg="white")
+
+cat(sprintf("\nFile salvati in: %s\n", out_dir))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 14 — OUTPUT LATEX
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("\n% ─── LaTeX ──────────────────────────────────────────────────────────────────\n")
+cat("\\begin{table}[h]\n\\centering\n")
+cat(sprintf(
+  "\\caption{Concentration measures for the symmetric international trade network (WIOD %d, $\\theta = %.4f$)}\n",
+  YEAR_BASE, THETA_BASE))
+cat("\\label{tab:trade_results}\n")
+cat("\\begin{tabular}{lc}\\hline\n")
+cat("Measure & Value \\\\\n\\hline\n")
+cat(sprintf("Herfindahl--Hirschman Index (HHI) & %.4f \\\\\n", H))
+cat(sprintf("Gini Coefficient                  & %.4f \\\\\n", G))
+cat(sprintf("Network Concentration Index (NCI) & %.4f \\\\\n", NCI))
+cat("\\hline\n\\end{tabular}\n\\end{table}\n")
+
+cat("\n=== Completato ===\n")
