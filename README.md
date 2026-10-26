@@ -82,12 +82,14 @@ Sections 5–6.
 If you use this code, please cite:
 
 ```bibtex
-@article{riso2026structural,
-  title   = {Structural Concentration in Weighted Networks:
-             A Class of Topology-Aware Indices},
-  author  = {Riso, Luigi and Zoia, Maria Grazia},
-  journal = {arXiv preprint arXiv:2603.21918},
-  year    = {2026}
+@article{RISO2026,
+title = {Structural concentration in weighted networks: A class of topology-aware indices},
+journal = {European Journal of Operational Research},
+year = {2026},
+issn = {0377-2217},
+doi = {https://doi.org/10.1016/j.ejor.2026.10.009},
+url = {https://www.sciencedirect.com/science/article/pii/S0377221726008398},
+author = {L. Riso and M.G. Zoia}
 }
 ```
 
